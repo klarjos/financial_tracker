@@ -78,6 +78,12 @@ SMA_LONG      = 50
 RSI_OVERSOLD  = 35
 RSI_OVERBOUGHT = 65
 
+# Fibonacci Screener
+FIB_LEVEL = 0.618
+FIB_MIN_SWING = 0.15
+FIB_PROXIMITY = 0.03
+FIB_EXTREMA_ORDER = 5
+
 # Feeds RSS de noticias
 NEWS_FEEDS = [
     ("Reuters Business",  "https://feeds.reuters.com/reuters/businessNews"),
@@ -885,6 +891,233 @@ def _fg_emoji(score: int) -> str:
     if score < 55:  return "😐"
     if score < 75:  return "😊"
     return "🤑"
+
+
+# ─── Fibonacci Screener ──────────────────────────────────────────────────────
+
+
+def _local_extrema(series: pd.Series, order: int = FIB_EXTREMA_ORDER):
+    highs, lows = [], []
+    for i in range(order, len(series) - order):
+        val = float(series.iloc[i])
+        if all(val >= float(series.iloc[i - j]) for j in range(1, order + 1)) and \
+           all(val >= float(series.iloc[i + j]) for j in range(1, order + 1)):
+            highs.append(i)
+        if all(val <= float(series.iloc[i - j]) for j in range(1, order + 1)) and \
+           all(val <= float(series.iloc[i + j]) for j in range(1, order + 1)):
+            lows.append(i)
+    return highs, lows
+
+
+def _find_significant_swing(close: pd.Series, min_amplitude: float = FIB_MIN_SWING) -> dict | None:
+    if len(close) < 30:
+        return None
+    high_idxs, low_idxs = _local_extrema(close)
+    if not high_idxs or not low_idxs:
+        return None
+
+    points = []
+    for i in high_idxs:
+        points.append(("high", i, float(close.iloc[i]), close.index[i]))
+    for i in low_idxs:
+        points.append(("low", i, float(close.iloc[i]), close.index[i]))
+    points.sort(key=lambda x: x[1], reverse=True)
+
+    for idx_a in range(len(points)):
+        for idx_b in range(idx_a + 1, len(points)):
+            pa, pb = points[idx_a], points[idx_b]
+            if pa[0] == pb[0]:
+                continue
+            if pa[0] == "high":
+                swing_high, swing_low = pa[2], pb[2]
+                high_date, low_date = pa[3], pb[3]
+            else:
+                swing_high, swing_low = pb[2], pa[2]
+                high_date, low_date = pb[3], pa[3]
+
+            if swing_low <= 0:
+                continue
+            amplitude = (swing_high - swing_low) / swing_low
+            if amplitude < min_amplitude:
+                continue
+
+            if high_date > low_date:
+                direction = "bullish"
+            else:
+                direction = "bearish"
+
+            return {
+                "swing_high": swing_high,
+                "swing_low": swing_low,
+                "high_date": high_date,
+                "low_date": low_date,
+                "direction": direction,
+                "amplitude": amplitude,
+            }
+    return None
+
+
+def _fibonacci_level(swing_high: float, swing_low: float,
+                     level: float = FIB_LEVEL, direction: str = "bullish") -> float:
+    if direction == "bullish":
+        return swing_high - (swing_high - swing_low) * level
+    return swing_low + (swing_high - swing_low) * level
+
+
+def _fibonacci_screen(tickers: list[str]) -> list[dict]:
+    results = []
+    skipped = 0
+    for ticker in tickers:
+        try:
+            df = yf.download(ticker, period="6mo", interval="1d",
+                             progress=False, auto_adjust=True)
+            if df.empty or len(df) < 30:
+                skipped += 1
+                continue
+            close = df["Close"].squeeze()
+            price = float(close.iloc[-1])
+
+            swing = _find_significant_swing(close)
+            if swing is None:
+                skipped += 1
+                continue
+
+            fib = _fibonacci_level(swing["swing_high"], swing["swing_low"],
+                                   FIB_LEVEL, swing["direction"])
+            dist = (price - fib) / fib * 100
+            if abs(dist) > FIB_PROXIMITY * 100:
+                continue
+
+            rsi_s = _rsi(close, RSI_PERIOD)
+            rsi_val = float(rsi_s.iloc[-1]) if not rsi_s.empty else 0.0
+
+            results.append({
+                "ticker": ticker,
+                "price": price,
+                "swing_high": swing["swing_high"],
+                "swing_low": swing["swing_low"],
+                "high_date": swing["high_date"],
+                "low_date": swing["low_date"],
+                "direction": swing["direction"],
+                "amplitude": swing["amplitude"],
+                "fib_618": fib,
+                "distance_pct": dist,
+                "rsi": rsi_val,
+            })
+        except Exception:
+            skipped += 1
+            continue
+
+    results.sort(key=lambda x: abs(x["distance_pct"]))
+    return results
+
+
+def generate_fibonacci_report() -> str:
+    today = datetime.now()
+    filename = f"{today.strftime('%Y_%m_%d')}_Fibonacci.md"
+
+    print("\n📐 Fibonacci Screener — Golden Ratio (0.618)")
+    print("=" * 55)
+
+    all_tickers = list(dict.fromkeys(MY_PORTFOLIO + WATCHLIST))
+    total = len(all_tickers)
+    print(f"⏳ Analizando {total} tickers...")
+
+    results = _fibonacci_screen(all_tickers)
+
+    buys = [r for r in results if r["direction"] == "bullish"]
+    resistances = [r for r in results if r["direction"] == "bearish"]
+    no_match = total - len(results)
+
+    L: list[str] = []
+    L += [
+        "# 📐 Fibonacci Screener — Golden Ratio (0.618)",
+        f"> Generado el **{today.strftime('%Y-%m-%d %H:%M')}**  ",
+        f"> Tickers analizados: {total} | Oportunidades encontradas: {len(results)}",
+        "",
+    ]
+
+    # Oportunidades de compra
+    L += [
+        "## 🟢 Oportunidades de Compra (retroceso en swing alcista)",
+        "",
+        "Tickers cuyo precio retrocedió ~61.8% de un movimiento alcista significativo (>15%).",
+        "Zona ideal para entrada en largo.",
+        "",
+    ]
+    if buys:
+        L += [
+            "| Ticker | Precio | Swing (Low→High) | Amplitud | Nivel 0.618 | Distancia | RSI |",
+            "|--------|--------|-------------------|----------|-------------|-----------|-----|",
+        ]
+        for r in buys:
+            ld = r["low_date"].strftime("%m/%d") if hasattr(r["low_date"], "strftime") else str(r["low_date"])[:5]
+            hd = r["high_date"].strftime("%m/%d") if hasattr(r["high_date"], "strftime") else str(r["high_date"])[:5]
+            L.append(
+                f"| {r['ticker']} | ${r['price']:,.2f} "
+                f"| ${r['swing_low']:,.2f}→${r['swing_high']:,.2f} ({ld}→{hd}) "
+                f"| +{r['amplitude']*100:.1f}% "
+                f"| ${r['fib_618']:,.2f} "
+                f"| {r['distance_pct']:+.1f}% "
+                f"| {r['rsi']:.0f} |"
+            )
+        L.append("")
+    else:
+        L += ["> Sin oportunidades de compra detectadas.", ""]
+
+    # Zonas de resistencia
+    L += [
+        "## ⚠️ Zonas de Resistencia (retroceso en swing bajista)",
+        "",
+        "Tickers cuyo precio rebotó ~61.8% de un movimiento bajista significativo (>15%).",
+        "Zona de posible rechazo — precaución al comprar.",
+        "",
+    ]
+    if resistances:
+        L += [
+            "| Ticker | Precio | Swing (High→Low) | Amplitud | Nivel 0.618 | Distancia | RSI |",
+            "|--------|--------|-------------------|----------|-------------|-----------|-----|",
+        ]
+        for r in resistances:
+            hd = r["high_date"].strftime("%m/%d") if hasattr(r["high_date"], "strftime") else str(r["high_date"])[:5]
+            ld = r["low_date"].strftime("%m/%d") if hasattr(r["low_date"], "strftime") else str(r["low_date"])[:5]
+            L.append(
+                f"| {r['ticker']} | ${r['price']:,.2f} "
+                f"| ${r['swing_high']:,.2f}→${r['swing_low']:,.2f} ({hd}→{ld}) "
+                f"| -{r['amplitude']*100:.1f}% "
+                f"| ${r['fib_618']:,.2f} "
+                f"| {r['distance_pct']:+.1f}% "
+                f"| {r['rsi']:.0f} |"
+            )
+        L.append("")
+    else:
+        L += ["> Sin zonas de resistencia detectadas.", ""]
+
+    # Resumen
+    L += [
+        "## 📊 Resumen",
+        "",
+        f"- Total analizados: {total}",
+        f"- Sin swing >15% o sin datos: {no_match}",
+        f"- **Oportunidades de compra: {len(buys)}**",
+        f"- **Zonas de resistencia: {len(resistances)}**",
+        "",
+        "---",
+        "",
+        f"*Fibonacci Screener generado automáticamente — {today.strftime('%Y-%m-%d %H:%M:%S')}*  ",
+        "*Fuentes: Yahoo Finance (yfinance)*  ",
+        "*⚠️ Solo informativo. No constituye asesoramiento financiero.*",
+    ]
+
+    report = "\n".join(L)
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(report)
+
+    print(f"\n🟢 Compra: {len(buys)} oportunidades")
+    print(f"⚠️  Resistencia: {len(resistances)} zonas")
+    print(f"✅ Reporte guardado: {filename}")
+
+    return filename
 
 
 # ─── Generador de reporte Markdown ───────────────────────────────────────────
@@ -1834,9 +2067,16 @@ if __name__ == "__main__":
         default=None,
         help="Ticker para generar un Deep Dive detallado (ej: --ticker NFLX)",
     )
+    parser.add_argument(
+        "--fibonacci", "-f",
+        action="store_true",
+        help="Ejecutar Fibonacci Screener — busca tickers cerca del nivel 0.618",
+    )
     args = parser.parse_args()
 
-    if args.ticker:
+    if args.fibonacci:
+        generate_fibonacci_report()
+    elif args.ticker:
         generate_deep_dive(args.ticker)
     else:
         generate_report()
