@@ -1,3 +1,5 @@
 __pycache__/
 .obsidian/
 *.pdf
+*.md
+!README.md
